@@ -22,6 +22,8 @@ jobs:
           go-version: 'stable'
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y libmpv-dev gcc libegl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+      - name: Run tests
+        run: go test -race ./...
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:

@@ -71,17 +71,18 @@ func (s *ServerManager) ConnectToServer(conf *ServerConfig, password string) err
 func (s *ServerManager) TestConnectionAndAuth(
 	ctx context.Context, connection ServerConnection, password string,
 ) error {
-	err := ErrUnreachable
+	errCh := make(chan error, 1)
 	done := make(chan bool)
 	go func() {
-		_, err = s.connect(connection, password)
+		_, e := s.connect(connection, password)
+		errCh <- e
 		close(done)
 	}()
 	select {
 	case <-ctx.Done():
-		return err
+		return ctx.Err()
 	case <-done:
-		return err
+		return <-errCh
 	}
 }
 
