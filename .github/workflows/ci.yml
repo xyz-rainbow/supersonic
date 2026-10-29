@@ -22,6 +22,8 @@ jobs:
           go-version: 'stable'
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y libmpv-dev gcc libegl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+      - name: Run tests
+        run: go test -race ./...
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
@@ -44,6 +46,7 @@ jobs:
             wget
             zip
             p7zip
+          msystem: CLANG64
       - uses: actions/checkout@v7
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -52,9 +55,9 @@ jobs:
       - name: Install Dependencies
         run: >
           pacman -Syu &&
-          pacman --noconfirm -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-mpv
+          pacman --noconfirm -S mingw-w64-clang-x86_64-toolchain mingw-w64-clang-x86_64-mpv
       - name: Install Fyne tool
-        run: go install fyne.io/fyne/v2/cmd/fyne@latest
+        run: go install fyne.io/tools/cmd/fyne@latest
       - name: Package
         run: make package_windows
       - name: Download mpv dll
@@ -86,7 +89,7 @@ jobs:
 
   build-macos-arm64:
     name: Build macOS arm64
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
