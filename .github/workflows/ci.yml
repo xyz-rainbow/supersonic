@@ -22,6 +22,8 @@ jobs:
           go-version: 'stable'
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y libmpv-dev gcc libegl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+      - name: Run tests
+        run: go test -race ./...
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
@@ -44,6 +46,7 @@ jobs:
             wget
             zip
             p7zip
+          msystem: CLANG64
       - uses: actions/checkout@v7
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -52,15 +55,15 @@ jobs:
       - name: Install Dependencies
         run: >
           pacman -Syu &&
-          pacman --noconfirm -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-mpv
+          pacman --noconfirm -S mingw-w64-clang-x86_64-toolchain mingw-w64-clang-x86_64-mpv
       - name: Install Fyne tool
         run: go install fyne.io/fyne/v2/cmd/fyne@latest
       - name: Package
         run: make package_windows
       - name: Download mpv dll
         run: >
-          wget https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-x86_64-20260610-git-304426c.7z &&
-          7z x mpv-dev-x86_64-20260610-git-304426c.7z
+          wget https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20250106/mpv-dev-x86_64-20250106-git-cfb2a0c.7z &&
+          7z x mpv-dev-x86_64-20250106-git-cfb2a0c.7z
       - name: Download smtc dll
         run: >
           wget https://github.com/supersonic-app/smtc-dll/releases/download/v0.1.2/SMTC.dll
@@ -86,7 +89,7 @@ jobs:
 
   build-macos-arm64:
     name: Build macOS arm64
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
