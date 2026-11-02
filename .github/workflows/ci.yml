@@ -57,13 +57,13 @@ jobs:
           pacman -Syu &&
           pacman --noconfirm -S mingw-w64-clang-x86_64-toolchain mingw-w64-clang-x86_64-mpv
       - name: Install Fyne tool
-        run: go install fyne.io/tools/cmd/fyne@latest
+        run: go install fyne.io/fyne/v2/cmd/fyne@latest
       - name: Package
         run: make package_windows
       - name: Download mpv dll
         run: >
-          wget https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-x86_64-20260610-git-304426c.7z &&
-          7z x mpv-dev-x86_64-20260610-git-304426c.7z
+          wget https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20250106/mpv-dev-x86_64-20250106-git-cfb2a0c.7z &&
+          7z x mpv-dev-x86_64-20250106-git-cfb2a0c.7z
       - name: Download smtc dll
         run: >
           wget https://github.com/supersonic-app/smtc-dll/releases/download/v0.1.2/SMTC.dll
