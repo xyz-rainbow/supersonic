@@ -1,3 +1,8 @@
+**English** | [Español](CONTRIBUTING.es.md)
+
+> This fork is maintained by Rainbow Technology (xyz-rainbow) and remains GNU GPL v3.
+> Pull requests are welcome and must be compatible with [LICENSE](LICENSE).
+
 # Contributing
 
 When contributing to this repository, please first discuss the change you wish to make via issue, discussion topic, or any other method with the owners of this repository before making a change.
