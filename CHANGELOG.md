@@ -1,5 +1,11 @@
 # Change Log
 
+## [Unreleased]
+
+### Added
+
+- Bilingual contributing guides. The existing project license was left unchanged (GPL-3.0 (upstream fork of dweymouth/supersonic); cannot relicense the combined work.).
+
 ## [0.22.0]
 
 ### Added
