@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"sync"
 	"context"
 	"errors"
 	"fmt"
@@ -17,7 +18,7 @@ import (
 	"github.com/dweymouth/supersonic/sharedutil"
 )
 
-// TODO: make thread-safe
+
 
 var (
 	ReplayGainNone  = player.ReplayGainNone.String()
@@ -60,6 +61,7 @@ type PlaybackStatus struct {
 }
 
 type playbackEngine struct {
+	mu            sync.RWMutex
 	ctx           context.Context
 	cancelPollPos context.CancelFunc
 	sm            *ServerManager
@@ -202,101 +204,155 @@ func (p *playbackEngine) unregisterPlayerCallbacks(pl player.BasePlayer) {
 func (p *playbackEngine) SetPlayer(pl player.BasePlayer) error {
 	needToUnpause := false
 
-	stat := p.CurrentPlayer().GetStatus()
-	if p.pendingPlayerChange || p.pendingLoadPaused {
+	stat := p.PlaybackStatus()
+	p.mu.RLock()
+	pendingPlayerChange := p.pendingPlayerChange
+	pendingLoadPaused := p.pendingLoadPaused
+	p.mu.RUnlock()
+	if pendingPlayerChange || pendingLoadPaused {
 		stat.State = player.Paused
-	}
-	if p.pendingLoadPaused {
-		stat.TimePos = p.pendingLoadStartTime
-		stat.Duration = p.curTrackDuration
+		needToUnpause = pendingLoadPaused
 	}
 
-	switch stat.State {
-	case player.Stopped:
-		// nothing
-	case player.Playing:
-		needToUnpause = true
-		p.stopPollTimePos()
-		fallthrough
-	case player.Paused:
-		p.pendingPlayerChangeStatus = stat
-		p.pendingPlayerChange = true
-	}
+	var url string
+	var meta mediaprovider.MediaItemMetadata
+	var track *mediaprovider.Track
+	var isTrack bool
+
+	p.mu.Lock()
+	p.pendingPlayerChange = true
+	p.pendingPlayerChangeStatus = player.Status{State: stat.State, TimePos: stat.TimePos}
+	p.mu.Unlock()
+
 	p.unregisterPlayerCallbacks(p.player)
-	if err := p.player.Stop(true); err != nil {
-		log.Printf("failed to stop player: %v", err)
-	}
-
-	oldVol := p.player.GetVolume()
-	if _, isMPV := p.player.(*mpv.Player); !isMPV {
-		p.player.Destroy()
-	}
+	p.player.Destroy()
+	p.mu.Lock()
 	p.player = pl
+	p.mu.Unlock()
 	p.registerPlayerCallbacks(pl)
 
-	if needToUnpause {
-		p.playTrackAt(p.nowPlayingIdx, p.pendingPlayerChangeStatus.TimePos)
-		p.pendingPlayerChange = false
-	}
-	vol := pl.GetVolume()
-	if oldVol != vol {
-		for _, cb := range p.onVolumeChange {
-			cb(vol)
+	idx := p.NowPlayingIndex()
+	if idx >= 0 {
+		item := p.getPlayQueueItemAt(idx)
+		url = p.getMediaURLForIdx(idx)
+		meta = item.Metadata()
+		track, isTrack = item.(*mediaprovider.Track)
+		if isTrack && p.audiocache != nil {
+			if filepath := p.audiocache.PathForCachedFile(track.ID); filepath != "" {
+				url = filepath
+			}
 		}
 	}
-	return nil
+
+	var err error
+	if urlP, ok := pl.(player.URLPlayer); ok {
+		err = urlP.PlayFile(url, meta, stat.TimePos)
+	} else if trackP, ok := pl.(player.TrackPlayer); ok && isTrack {
+		err = trackP.PlayTrack(track, stat.TimePos)
+	} else if stat.State != player.Stopped {
+		return errors.New("unknown player type")
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if stat.State == player.Paused {
+		err = pl.Pause()
+	} else if stat.State == player.Playing {
+		err = pl.Continue()
+	}
+	p.mu.Lock()
+	p.pendingPlayerChange = false
+	p.mu.Unlock()
+
+	if needToUnpause {
+		p.Continue()
+	}
+
+	return err
 }
 
 // ======================= START PLAY QUEUE FUNCS ===========================
 
 func (p *playbackEngine) getPlayQueue() []mediaprovider.MediaItem {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.playQueue
 }
 
 func (p *playbackEngine) getShuffledPlayQueue() []mediaprovider.MediaItem {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.shuffledPlayQueue
 }
 
 func (p *playbackEngine) getActivePlayQueue() []mediaprovider.MediaItem {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.getActivePlayQueueUnsafe()
+}
+
+func (p *playbackEngine) getActivePlayQueueUnsafe() []mediaprovider.MediaItem {
 	if p.shuffle {
 		return p.shuffledPlayQueue
 	}
 	return p.playQueue
 }
 
+func (p *playbackEngine) getPlayQueueLengthUnsafe() int {
+	return len(p.getActivePlayQueueUnsafe())
+}
+
+func (p *playbackEngine) getPlayQueueItemAtUnsafe(idx int) mediaprovider.MediaItem {
+	return p.getActivePlayQueueUnsafe()[idx]
+}
+
 func (p *playbackEngine) getPlayQueueLength() int {
-	return len(p.getActivePlayQueue())
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.getPlayQueueLengthUnsafe()
 }
 
 func (p *playbackEngine) clearPlayQueue() {
 	p.checkScrobble()
-	p.player.Stop(false)
-	p.nowPlayingIdx = -1
+	p.mu.Lock()
 	p.playQueue = nil
 	p.shuffledPlayQueue = nil
+	p.nowPlayingIdx = -1
+	p.isRadio = false
+	p.mu.Unlock()
 }
 
 func (p *playbackEngine) setPlayQueue(items []mediaprovider.MediaItem) {
+	p.mu.Lock()
 	p.playQueue = items
+	p.mu.Unlock()
 }
 
 func (p *playbackEngine) setShuffledPlayQueue(items []mediaprovider.MediaItem) {
+	p.mu.Lock()
 	p.shuffledPlayQueue = items
+	p.mu.Unlock()
 }
 
 func (p *playbackEngine) getPlayQueueItemAt(idx int) mediaprovider.MediaItem {
-	return p.getActivePlayQueue()[idx]
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.getPlayQueueItemAtUnsafe(idx)
 }
 
 func (p *playbackEngine) insertItemsIntoPlayQueueAt(items []mediaprovider.MediaItem, idx int, queueType QueueType) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	switch queueType {
-	case Both:
-		p.playQueue = append(p.playQueue[:idx], append(items, p.playQueue[idx:]...)...)
-		p.shuffledPlayQueue = append(p.shuffledPlayQueue[:idx], append(items, p.shuffledPlayQueue[idx:]...)...)
 	case PlayQueue:
-		p.playQueue = append(p.playQueue[:idx], append(items, p.playQueue[idx:]...)...)
+		p.playQueue = slices.Insert(p.playQueue, idx, items...)
 	case ShuffledPlayQueue:
-		p.shuffledPlayQueue = append(p.shuffledPlayQueue[:idx], append(items, p.shuffledPlayQueue[idx:]...)...)
+		p.shuffledPlayQueue = slices.Insert(p.shuffledPlayQueue, idx, items...)
+	case Both:
+		p.playQueue = append(p.playQueue, items...)
+		p.shuffledPlayQueue = slices.Insert(p.shuffledPlayQueue, idx, items...)
 	}
 }
 
@@ -315,6 +371,19 @@ func (p *playbackEngine) GetActivePlayQueueDeepCopy() []mediaprovider.MediaItem 
 // ======================== END PLAY QUEUE FUNCS =============================
 
 func (p *playbackEngine) PlayTrackAt(idx int) error {
+	p.mu.Lock()
+	if idx < 0 || idx >= p.getPlayQueueLengthUnsafe() {
+		p.mu.Unlock()
+		return errors.New("Play queue index out of bounds")
+	}
+	p.nowPlayingIdx = idx
+	p.mu.Unlock()
+
+	p.invokeNoArgCallbacks(p.onQueueChange)
+	p.invokeOnSongChangeCallbacks()
+	p.reportPlayback("playing")
+	p.handleNextTrackUpdated()
+	p.checkScrobble()
 	return p.playTrackAt(idx, 0)
 }
 
@@ -322,17 +391,20 @@ func (p *playbackEngine) PlayTrackAt(idx int) error {
 // paused at startTime, firing UI/OS-integration callbacks, but does NOT touch
 // the underlying player. Call Continue() to actually begin playback.
 func (p *playbackEngine) loadTrackPaused(idx int, startTime float64) error {
-	if l := p.getPlayQueueLength(); idx < 0 || idx >= l {
+	p.mu.Lock()
+	if l := p.getPlayQueueLengthUnsafe(); idx < 0 || idx >= l {
+		p.mu.Unlock()
 		return fmt.Errorf("track index (%d) out of range (0-%d)", idx, l)
 	}
 	p.nowPlayingIdx = idx
-	nowPlaying := p.getPlayQueueItemAt(idx)
+	nowPlaying := p.getPlayQueueItemAtUnsafe(idx)
 	_, p.isRadio = nowPlaying.(*mediaprovider.RadioStation)
 	p.wasStopped = false
 	p.alreadyScrobbled = false
 	p.curTrackDuration = nowPlaying.Metadata().Duration.Seconds()
 	p.pendingLoadPaused = true
 	p.pendingLoadStartTime = startTime
+	p.mu.Unlock()
 
 	// Pre-generate the waveform image for the paused track using the same hook
 	// that normally pre-generates waveforms for the upcoming track.
@@ -348,47 +420,49 @@ func (p *playbackEngine) loadTrackPaused(idx int, startTime float64) error {
 }
 
 func (p *playbackEngine) playTrackAt(idx int, startTime float64) error {
-	if l := p.getPlayQueueLength(); idx < 0 || idx >= l {
-		return fmt.Errorf("track index (%d) out of range (0-%d)", idx, l)
-	}
+	p.mu.Lock()
 	p.pendingLoadPaused = false
-	// scrobble current track if needed
-	p.checkScrobble()
-	p.alreadyScrobbled = true
 	p.pendingTrackChangeNum = idx
+	p.mu.Unlock()
 	err := p.setTrack(idx, false, startTime)
 	return err
 }
 
 // Gets the curently playing media item, if any.
 func (p *playbackEngine) NowPlaying() mediaprovider.MediaItem {
-	if p.nowPlayingIdx < 0 || p.getPlayQueueLength() == 0 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.nowPlayingIdx < 0 || p.getPlayQueueLengthUnsafe() == 0 {
 		return nil
 	}
 	if !p.pendingLoadPaused && p.player.GetStatus().State == player.Stopped {
 		return nil
 	}
-	return p.getPlayQueueItemAt(p.nowPlayingIdx)
+	return p.getPlayQueueItemAtUnsafe(p.nowPlayingIdx)
 }
 
 func (p *playbackEngine) NowPlayingIndex() int {
-	return int(p.nowPlayingIdx)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.nowPlayingIdx
 }
 
 func (p *playbackEngine) SetLoopMode(loopMode LoopMode) {
+	p.mu.Lock()
 	p.loopMode = loopMode
-	if p.nowPlayingIdx >= 0 {
-		// TODO - don't need when going from LoopNone to LoopAll
-		// if not on last track
+	nowPlayingIdx := p.nowPlayingIdx
+	p.mu.Unlock()
+	if nowPlayingIdx >= 0 {
 		p.handleNextTrackUpdated()
 	}
-
 	for _, cb := range p.onLoopModeChange {
 		cb(loopMode)
 	}
 }
 
 func (p *playbackEngine) GetLoopMode() LoopMode {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.loopMode
 }
 
@@ -404,17 +478,21 @@ func (p *playbackEngine) GetTrackIdxByIdFrom(items []mediaprovider.MediaItem, id
 }
 
 func (p *playbackEngine) SetShuffle(shuffle bool) {
+	p.mu.Lock()
 	if p.shuffle == shuffle {
+		p.mu.Unlock()
 		return
 	}
+	p.shuffle = shuffle
+	p.mu.Unlock()
 
 	for _, cb := range p.onShuffleChange {
 		cb(shuffle)
 	}
-	p.shuffle = shuffle
 
-	// guard against changing shuffle with an empty queue
-	if p.getPlayQueue() == nil || len(p.getPlayQueue()) == 0 {
+	p.mu.Lock()
+	if p.playQueue == nil || len(p.playQueue) == 0 {
+		p.mu.Unlock()
 		return
 	}
 
@@ -424,57 +502,69 @@ func (p *playbackEngine) SetShuffle(shuffle bool) {
 		rand.Shuffle(len(shuffledQueue), func(i, j int) {
 			shuffledQueue[i], shuffledQueue[j] = shuffledQueue[j], shuffledQueue[i]
 		})
-		if p.nowPlayingIdx >= 0 && len(p.getPlayQueue()) > p.nowPlayingIdx {
-			nowPlayingID := p.getPlayQueue()[p.nowPlayingIdx].Metadata().ID
-			p.setShuffledPlayQueue(sharedutil.ReorderItems(shuffledQueue, []int{p.GetTrackIdxByIdFrom(shuffledQueue, nowPlayingID)}, 0))
+		if p.nowPlayingIdx >= 0 && len(p.playQueue) > p.nowPlayingIdx {
+			nowPlayingID := p.playQueue[p.nowPlayingIdx].Metadata().ID
+			p.shuffledPlayQueue = sharedutil.ReorderItems(shuffledQueue, []int{p.GetTrackIdxByIdFrom(shuffledQueue, nowPlayingID)}, 0)
 		} else {
+			p.mu.Unlock()
 			return
 		}
 	} else {
-		if p.nowPlayingIdx >= 0 && len(p.getShuffledPlayQueue()) > p.nowPlayingIdx {
-			nowPlayingID := p.getShuffledPlayQueue()[p.nowPlayingIdx].Metadata().ID
+		if p.nowPlayingIdx >= 0 && len(p.shuffledPlayQueue) > p.nowPlayingIdx {
+			nowPlayingID := p.shuffledPlayQueue[p.nowPlayingIdx].Metadata().ID
 			newNowPlayingIdx = p.GetTrackIdxByIdFrom(p.playQueue, nowPlayingID)
 		} else {
+			p.mu.Unlock()
 			return
 		}
 	}
-
 	p.nowPlayingIdx = newNowPlayingIdx
+	p.mu.Unlock()
+
 	p.handleNextTrackUpdated()
 	p.invokeNoArgCallbacks(p.onQueueChange)
 }
 
 func (p *playbackEngine) PlaybackStatus() PlaybackStatus {
-	if p.pendingLoadPaused {
+	p.mu.RLock()
+	pendingLoadPaused := p.pendingLoadPaused
+	pendingLoadStartTime := p.pendingLoadStartTime
+	pendingPlayerChange := p.pendingPlayerChange
+	pendingPlayerChangeStatus := p.pendingPlayerChangeStatus
+	curTrackDuration := p.curTrackDuration
+	currentPlayer := p.CurrentPlayerUnsafe()
+	p.mu.RUnlock()
+	if pendingLoadPaused {
 		return PlaybackStatus{
 			State:    player.Paused,
-			TimePos:  p.pendingLoadStartTime,
-			Duration: p.curTrackDuration,
+			TimePos:  pendingLoadStartTime,
+			Duration: curTrackDuration,
 		}
 	}
-	stat := p.pendingPlayerChangeStatus
-	if !p.pendingPlayerChange {
-		stat = p.CurrentPlayer().GetStatus()
+
+	var stat player.Status
+	if pendingPlayerChange {
+		stat = pendingPlayerChangeStatus
+	} else if currentPlayer != nil {
+		stat = currentPlayer.GetStatus()
 	}
 	return PlaybackStatus{
 		State:    stat.State,
 		TimePos:  stat.TimePos,
-		Duration: p.curTrackDuration,
+		Duration: curTrackDuration,
 	}
 }
 
 func (p *playbackEngine) SetVolume(vol int) error {
-	vol = clamp(vol, 0, 100)
-	if err := p.player.SetVolume(vol); err != nil {
-		return err
-	}
-	for _, cb := range p.onVolumeChange {
-		cb(vol)
-	}
-	return nil
+	return p.CurrentPlayer().SetVolume(vol)
 }
 
+func (p *playbackEngine) CurrentPlayerUnsafe() player.BasePlayer {
+	return p.player
+}
 func (p *playbackEngine) CurrentPlayer() player.BasePlayer {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.player
 }
 
@@ -482,82 +572,75 @@ func (p *playbackEngine) SeekNext() error {
 	if p.PlaybackStatus().State == player.Stopped {
 		return nil
 	}
-	return p.PlayTrackAt(p.nowPlayingIdx + 1)
+	return p.PlayTrackAt(p.NowPlayingIndex() + 1)
 }
 
 func (p *playbackEngine) SeekBackOrPrevious() error {
-	if p.nowPlayingIdx == 0 || p.PlaybackStatus().TimePos > 3 {
+	idx := p.NowPlayingIndex()
+	if idx == 0 || p.PlaybackStatus().TimePos > 3 {
 		return p.player.SeekSeconds(0)
 	}
-	return p.PlayTrackAt(p.nowPlayingIdx - 1)
+	return p.PlayTrackAt(idx - 1)
 }
 
 func (p *playbackEngine) SeekFwdBackN(n int) error {
-	idx := p.nowPlayingIdx
+	idx := p.NowPlayingIndex()
 	if n < 0 && p.PlaybackStatus().TimePos > 3 {
 		n += 1 // first seek back is just seek to beginning of current
 	}
-	if n == 0 || (idx == 0 && n < 0) {
-		return p.player.SeekSeconds(0) // seek back in current song
-	}
-
-	lastIdx := p.getPlayQueueLength() - 1
-	newIdx := min(lastIdx, max(0, idx+n))
-
-	if idx == lastIdx && n > 0 {
-		newIdx = 0
-	}
-	return p.PlayTrackAt(newIdx)
+	return p.PlayTrackAt(idx + n)
 }
 
 // Seek to given absolute position in the current track by seconds.
 func (p *playbackEngine) SeekSeconds(sec float64) error {
-	if p.isRadio {
-		return nil // can't seek radio stations
-	}
-	return p.player.SeekSeconds(sec)
+	return p.CurrentPlayer().SeekSeconds(sec)
 }
 
 func (p *playbackEngine) IsSeeking() bool {
-	return p.player.IsSeeking()
+	return p.CurrentPlayer().IsSeeking()
 }
 
 func (p *playbackEngine) Stop() error {
-	if p.pendingLoadPaused {
-		p.pendingLoadPaused = false
-		p.pendingLoadStartTime = 0
-		p.handleOnStopped()
-	}
-	return p.player.Stop(false)
+	p.mu.Lock()
+	p.pendingLoadPaused = false
+	p.mu.Unlock()
+	return p.CurrentPlayer().Stop(true)
 }
 
 func (p *playbackEngine) SetPauseAfterCurrent(pauseAfterCurrent bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.pauseAfterCurrent = pauseAfterCurrent
 }
 
 func (p *playbackEngine) Pause() error {
-	return p.player.Pause()
+	stat := p.PlaybackStatus()
+	if stat.State == player.Paused {
+		return nil
+	}
+	p.mu.Lock()
+	if p.pendingPlayerChange {
+		p.pendingPlayerChangeStatus.State = player.Paused
+	}
+	p.mu.Unlock()
+	return p.CurrentPlayer().Pause()
 }
 
 func (p *playbackEngine) Continue() error {
-	if p.pendingLoadPaused {
-		p.pendingLoadPaused = false
-		// Use pendingTrackChangeNum so handleOnTrackChange doesn't advance nowPlayingIdx.
-		// Set alreadyScrobbled so it doesn't try to scrobble the not-yet-played track.
-		p.pendingTrackChangeNum = p.nowPlayingIdx
-		p.alreadyScrobbled = true
-		return p.setTrack(p.nowPlayingIdx, false, p.pendingLoadStartTime)
+	stat := p.PlaybackStatus()
+	p.mu.RLock()
+	idx := p.nowPlayingIdx
+	p.mu.RUnlock()
+	if stat.State == player.Stopped && idx >= 0 {
+		return p.PlayTrackAt(idx)
 	}
-
+	p.mu.Lock()
+	p.pendingLoadPaused = false
 	if p.pendingPlayerChange {
-		p.pendingPlayerChange = false
-		return p.playTrackAt(p.nowPlayingIdx, p.pendingPlayerChangeStatus.TimePos)
+		p.pendingPlayerChangeStatus.State = player.Playing
 	}
-
-	if p.PlaybackStatus().State == player.Stopped {
-		return p.PlayTrackAt(0)
-	}
-	return p.player.Continue()
+	p.mu.Unlock()
+	return p.CurrentPlayer().Continue()
 }
 
 // Load items into the specified queue(s). This overrides the queue. For standard inserts or replaces use p.LoadItems
@@ -589,7 +672,11 @@ func (p *playbackEngine) LoadItems(items []mediaprovider.MediaItem, insertQueueM
 func (p *playbackEngine) LoadItemsAndPlayAtIdx(items []mediaprovider.MediaItem, shuffle bool, idx int) error {
 	newItems := deepCopyMediaItemSlice(items)
 
-	if p.shuffle || shuffle {
+	p.mu.Lock()
+	isShuffle := p.shuffle
+	p.mu.Unlock()
+
+	if isShuffle || shuffle {
 		p.clearPlayQueue()
 		rand.Shuffle(len(newItems), func(i, j int) {
 			newItems[i], newItems[j] = newItems[j], newItems[i]
@@ -624,7 +711,12 @@ func (p *playbackEngine) doLoaditems(items []mediaprovider.MediaItem, insertQueu
 	if insertQueueMode == Replace {
 		p.clearPlayQueue()
 	}
-	if nextChanged := len(items) > 0 && (insertQueueMode != Append || (p.nowPlayingIdx == p.getPlayQueueLength()-1)); nextChanged {
+	p.mu.RLock()
+	nowPlayingIdx := p.nowPlayingIdx
+	queueLen := p.getPlayQueueLengthUnsafe()
+	isShuffle := p.shuffle
+	p.mu.RUnlock()
+	if nextChanged := len(items) > 0 && (insertQueueMode != Append || (nowPlayingIdx == queueLen-1)); nextChanged {
 		defer p.handleNextTrackUpdated()
 	}
 
@@ -632,10 +724,10 @@ func (p *playbackEngine) doLoaditems(items []mediaprovider.MediaItem, insertQueu
 		rand.Shuffle(len(items), func(i, j int) { items[i], items[j] = items[j], items[i] })
 	}
 
-	insertIdx := p.getPlayQueueLength()
+	insertIdx := queueLen
 
 	if insertQueueMode == Replace {
-		if p.shuffle {
+		if isShuffle {
 			shuffledItems := deepCopyMediaItemSlice(items)
 			rand.Shuffle(len(shuffledItems), func(i, j int) { shuffledItems[i], shuffledItems[j] = shuffledItems[j], shuffledItems[i] })
 
@@ -646,9 +738,9 @@ func (p *playbackEngine) doLoaditems(items []mediaprovider.MediaItem, insertQueu
 		}
 	} else {
 		if insertQueueMode == InsertNext {
-			insertIdx = p.nowPlayingIdx + 1
+			insertIdx = nowPlayingIdx + 1
 		}
-		if p.shuffle {
+		if isShuffle {
 			queueType = Both
 		}
 		p.insertItemsIntoPlayQueueAt(items, insertIdx, queueType)
@@ -659,33 +751,47 @@ func (p *playbackEngine) doLoaditems(items []mediaprovider.MediaItem, insertQueu
 }
 
 func (p *playbackEngine) LoadRadioStation(radio *mediaprovider.RadioStation, insertMode InsertQueueMode) {
+	p.mu.Lock()
+	p.isRadio = true
+	p.shuffle = false
+	p.mu.Unlock()
 	if insertMode == Replace {
 		p.clearPlayQueue()
 	}
-	if nextChanged := insertMode == InsertNext || (insertMode == Append && p.nowPlayingIdx == p.getPlayQueueLength()-1); nextChanged {
+	p.mu.RLock()
+	nowPlayingIdx := p.nowPlayingIdx
+	queueLen := p.getPlayQueueLengthUnsafe()
+	p.mu.RUnlock()
+	if nextChanged := insertMode == InsertNext || (insertMode == Append && nowPlayingIdx == queueLen-1); nextChanged {
 		p.handleNextTrackUpdated()
 	}
-	insertIdx := p.getPlayQueueLength()
+	insertIdx := queueLen
 	if insertMode == InsertNext {
-		insertIdx = p.nowPlayingIdx + 1
+		insertIdx = nowPlayingIdx + 1
 	}
-	p.insertItemsIntoPlayQueueAt([]mediaprovider.MediaItem{radio}, insertIdx, Both)
+	p.insertItemsIntoPlayQueueAt([]mediaprovider.MediaItem{radio}, insertIdx, PlayQueue)
+
 	p.invokeNoArgCallbacks(p.onQueueChange)
+	if insertMode == Replace {
+		p.PlayTrackAt(0)
+	}
 }
 
 // Stop playback and clear the play queue.
 func (p *playbackEngine) StopAndClearPlayQueue() {
-	changed := p.getPlayQueueLength() > 0
+	p.Stop()
 	p.clearPlayQueue()
-	if changed {
-		p.invokeNoArgCallbacks(p.onQueueChange)
-	}
+	p.invokeNoArgCallbacks(p.onQueueChange)
+	p.invokeOnSongChangeCallbacks()
+	p.handleNextTrackUpdated()
 }
 
 // Any time the user changes the favorite status of a track elsewhere in the app,
 // this should be called to ensure the in-memory track model is updated.
 func (p *playbackEngine) OnTrackFavoriteStatusChanged(id string, fav bool) {
-	if item := sharedutil.FindMediaItemByID(id, p.getActivePlayQueue()); item != nil {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if item := sharedutil.FindMediaItemByID(id, p.getActivePlayQueueUnsafe()); item != nil {
 		if tr, ok := item.(*mediaprovider.Track); ok {
 			tr.Favorite = fav
 		}
@@ -695,7 +801,9 @@ func (p *playbackEngine) OnTrackFavoriteStatusChanged(id string, fav bool) {
 // Any time the user changes the rating of a track elsewhere in the app,
 // this should be called to ensure the in-memory track model is updated.
 func (p *playbackEngine) OnTrackRatingChanged(id string, rating int) {
-	if item := sharedutil.FindMediaItemByID(id, p.getActivePlayQueue()); item != nil {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if item := sharedutil.FindMediaItemByID(id, p.getActivePlayQueueUnsafe()); item != nil {
 		if tr, ok := item.(*mediaprovider.Track); ok {
 			tr.Rating = rating
 		}
@@ -706,10 +814,11 @@ func (p *playbackEngine) OnTrackRatingChanged(id string, rating int) {
 // Does not stop playback if the currently playing track is in the new queue,
 // but updates the now playing index to point to the first instance of the track in the new queue.
 func (p *playbackEngine) UpdatePlayQueue(items []mediaprovider.MediaItem) error {
+	p.mu.Lock()
 	newQueue := deepCopyMediaItemSlice(items)
 	newNowPlayingIdx := -1
 	if p.nowPlayingIdx >= 0 {
-		nowPlayingID := p.getPlayQueueItemAt(p.nowPlayingIdx).Metadata().ID
+		nowPlayingID := p.getActivePlayQueueUnsafe()[p.nowPlayingIdx].Metadata().ID
 		for i, tr := range newQueue {
 			if tr.Metadata().ID == nowPlayingID {
 				newNowPlayingIdx = i
@@ -718,69 +827,70 @@ func (p *playbackEngine) UpdatePlayQueue(items []mediaprovider.MediaItem) error 
 		}
 	}
 	if p.shuffle {
-		p.setShuffledPlayQueue(newQueue)
+		p.shuffledPlayQueue = newQueue
 	} else {
-		p.setPlayQueue(newQueue)
+		p.playQueue = newQueue
 	}
-	if p.nowPlayingIdx >= 0 && newNowPlayingIdx == -1 {
+	wasPlaying := p.nowPlayingIdx >= 0
+	p.nowPlayingIdx = newNowPlayingIdx
+	p.mu.Unlock()
+	if wasPlaying && newNowPlayingIdx == -1 {
 		return p.Stop()
 	}
-	if p.nowPlayingIdx >= 0 {
+	if wasPlaying {
 		p.handleNextTrackUpdated()
 	}
-	p.nowPlayingIdx = newNowPlayingIdx
 
 	p.invokeNoArgCallbacks(p.onQueueChange)
 	return nil
 }
 
 func (p *playbackEngine) RemoveTracksFromQueue(idxs []int) {
+	p.mu.Lock()
 	isPlayingTrackRemoved := false
 	isNextPlayingTrackremoved := false
-	nowPlaying := p.NowPlayingIndex()
+	nowPlaying := p.nowPlayingIdx
 	newNowPlaying := nowPlaying
 
 	if p.shuffle {
-		// remove tracks by ID from playQueue
-		ids := p.GetTrackIdsFromIdx(idxs)
-		newPlayQueue := make([]mediaprovider.MediaItem, 0, p.getPlayQueueLength()-len(idxs))
-		for _, tr := range p.getPlayQueue() {
+		ids := p.getTrackIdsFromIdxUnsafe(idxs)
+		newPlayQueue := make([]mediaprovider.MediaItem, 0, p.getPlayQueueLengthUnsafe()-len(idxs))
+		for _, tr := range p.playQueue {
 			if slices.Contains(ids, tr.Metadata().ID) {
-				//remove id from id list, handles having the same track present multiple times in playQueue
 				idx := slices.Index(ids, tr.Metadata().ID)
 				ids = slices.Delete(ids, idx, idx+1)
 			} else {
-				// not removing this track
 				newPlayQueue = append(newPlayQueue, tr)
 			}
 		}
-		p.setPlayQueue(newPlayQueue)
+		p.playQueue = newPlayQueue
 
-		newShuffledQueue := make([]mediaprovider.MediaItem, 0, p.getPlayQueueLength()-len(idxs))
-		p.RemoveTracksFromQueueByIdx(idxs, &newShuffledQueue, &newNowPlaying, &isPlayingTrackRemoved, &isNextPlayingTrackremoved)
-		p.setShuffledPlayQueue(newShuffledQueue)
+		newShuffledQueue := make([]mediaprovider.MediaItem, 0, p.getPlayQueueLengthUnsafe()-len(idxs))
+		p.removeTracksFromQueueByIdxUnsafe(idxs, &newShuffledQueue, &newNowPlaying, &isPlayingTrackRemoved, &isNextPlayingTrackremoved)
+		p.shuffledPlayQueue = newShuffledQueue
 	} else {
-		newPlayQueue := make([]mediaprovider.MediaItem, 0, p.getPlayQueueLength()-len(idxs))
-		p.RemoveTracksFromQueueByIdx(idxs, &newPlayQueue, &newNowPlaying, &isPlayingTrackRemoved, &isNextPlayingTrackremoved)
-		p.setPlayQueue(newPlayQueue)
+		newPlayQueue := make([]mediaprovider.MediaItem, 0, p.getPlayQueueLengthUnsafe()-len(idxs))
+		p.removeTracksFromQueueByIdxUnsafe(idxs, &newPlayQueue, &newNowPlaying, &isPlayingTrackRemoved, &isNextPlayingTrackremoved)
+		p.playQueue = newPlayQueue
 	}
 
 	p.nowPlayingIdx = newNowPlaying
+	newQueueLength := p.getPlayQueueLengthUnsafe()
+	p.mu.Unlock()
+
 	if isPlayingTrackRemoved {
-		if newNowPlaying == p.getPlayQueueLength() {
-			// we had been playing the last track, and removed it
+		if newNowPlaying == newQueueLength {
 			p.Stop()
 		} else {
-			p.nowPlayingIdx -= 1 // will be incremented in newtrack callback from player
+			p.mu.Lock()
+			p.nowPlayingIdx -= 1
+			p.mu.Unlock()
 			p.setTrack(newNowPlaying, false, 0)
 		}
-		// setNextTrack and onSongChange callbacks will be handled
-		// when we receive new track event from player
 	} else if isNextPlayingTrackremoved {
-		if newNowPlaying < p.getPlayQueueLength()-1 {
+		if newNowPlaying < newQueueLength-1 {
 			p.handleNextTrackUpdated()
 		} else {
-			// no next track to play
 			p.setNextTrack(-1)
 		}
 	}
@@ -788,47 +898,53 @@ func (p *playbackEngine) RemoveTracksFromQueue(idxs []int) {
 	p.invokeNoArgCallbacks(p.onQueueChange)
 }
 
-func (p *playbackEngine) RemoveTracksFromQueueByIdx(idxs []int, newQueue *[]mediaprovider.MediaItem, newNowPlaying *int, isPlayingTrackRemoved *bool, isNextPlayingTrackRemoved *bool) {
+func (p *playbackEngine) removeTracksFromQueueByIdxUnsafe(idxs []int, newQueue *[]mediaprovider.MediaItem, newNowPlaying *int, isPlayingTrackRemoved *bool, isNextPlayingTrackRemoved *bool) {
 	idxSet := sharedutil.ToSet(idxs)
-	nowPlaying := p.NowPlayingIndex()
+	nowPlaying := p.nowPlayingIdx
 
-	for i, tr := range p.getActivePlayQueue() {
+	for i, tr := range p.getActivePlayQueueUnsafe() {
 		if _, ok := idxSet[i]; ok {
 			if i < nowPlaying {
-				// if removing a track earlier than the currently playing one (if any),
-				// decrement new now playing index by one to account for new position in queue
 				*newNowPlaying--
 			} else if i == nowPlaying {
 				*isPlayingTrackRemoved = true
-				// If we are removing the currently playing track, we need to scrobble it
+				// Note: checkScrobble takes a lock, so we temporarily release it
+				p.mu.Unlock()
 				p.checkScrobble()
+				p.mu.Lock()
 				p.alreadyScrobbled = true
 			} else if nowPlaying >= 0 && i == nowPlaying+1 {
 				*isNextPlayingTrackRemoved = true
 			}
 		} else {
-			// not removing this track
 			*newQueue = append(*newQueue, tr)
 		}
 	}
 }
 
 func (p *playbackEngine) GetTrackIdsFromIdx(idx []int) []string {
-	ids := make([]string, 0, len(idx))
-	for _, v := range idx {
-		ids = append(ids, p.getPlayQueueItemAt(v).Metadata().ID)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.getTrackIdsFromIdxUnsafe(idx)
+}
+func (p *playbackEngine) getTrackIdsFromIdxUnsafe(idx []int) []string {
+	ids := make([]string, len(idx))
+	for i, id := range idx {
+		ids[i] = p.getActivePlayQueueUnsafe()[id].Metadata().ID
 	}
 	return ids
 }
 
 func (p *playbackEngine) SetReplayGainOptions(config ReplayGainConfig) {
-	rGainPlayer, ok := p.player.(player.ReplayGainPlayer)
+	rGainPlayer, ok := p.CurrentPlayer().(player.ReplayGainPlayer)
 	if !ok {
-		log.Println("Error: player doesn't support ReplayGain")
+		log.Println("Error: player doesn\x27t support ReplayGain")
 		return
 	}
 
+	p.mu.Lock()
 	p.replayGainCfg = config
+	p.mu.Unlock()
 	mode := player.ReplayGainNone
 	switch config.Mode {
 	case ReplayGainAuto:
@@ -847,14 +963,17 @@ func (p *playbackEngine) SetReplayGainOptions(config ReplayGainConfig) {
 }
 
 func (p *playbackEngine) SetReplayGainMode(mode player.ReplayGainMode) {
-	rGainPlayer, ok := p.player.(player.ReplayGainPlayer)
+	rGainPlayer, ok := p.CurrentPlayer().(player.ReplayGainPlayer)
 	if !ok {
-		log.Println("Error: player doesn't support ReplayGain")
+		log.Println("Error: player doesn\x27t support ReplayGain")
 		return
 	}
+	p.mu.RLock()
+	cfg := p.replayGainCfg
+	p.mu.RUnlock()
 	rGainPlayer.SetReplayGainOptions(player.ReplayGainOptions{
-		PreventClipping: p.replayGainCfg.PreventClipping,
-		PreampGain:      p.replayGainCfg.PreampGainDB,
+		PreventClipping: cfg.PreventClipping,
+		PreampGain:      cfg.PreampGainDB,
 		Mode:            mode,
 	})
 }
@@ -865,20 +984,27 @@ func (p *playbackEngine) cacheNextTracks() {
 		fetch := make([]AudioCacheRequest, 0, 3)
 		// if nothing is playing (index = -1), treat the beginning of the queue as
 		// the "currently" playing track, since we're probably about to play it
+		p.mu.RLock()
 		npI := max(p.nowPlayingIdx, 0)
+		queueLen := p.getPlayQueueLengthUnsafe()
 		for _, idx := range [3]int{npI, npI + 1, npI + 2} {
-			if idx > 0 && idx < p.getPlayQueueLength() {
-				item := p.getPlayQueueItemAt(idx)
+			if idx >= 0 && idx < queueLen {
+				item := p.getPlayQueueItemAtUnsafe(idx)
 				if item.Metadata().Type == mediaprovider.MediaItemTypeTrack {
 					fetch = append(fetch, AudioCacheRequest{
-						ID:          p.getPlayQueueItemAt(idx).Metadata().ID,
-						DownloadURL: p.getMediaURLForIdx(idx),
+						ID:          item.Metadata().ID,
+						DownloadURL: p.getMediaURLForIdxUnsafe(idx),
 					})
 				}
 			}
 		}
+		var np mediaprovider.MediaItem
+		if p.nowPlayingIdx >= 0 && p.nowPlayingIdx < queueLen && p.getPlayQueueLengthUnsafe() > 0 {
+			np = p.getPlayQueueItemAtUnsafe(p.nowPlayingIdx)
+		}
+		p.mu.RUnlock()
 		id := ""
-		if np := p.NowPlaying(); np != nil {
+		if np != nil {
 			id = np.Metadata().ID
 		}
 		p.audiocache.CacheOnly(id, fetch)
@@ -887,23 +1013,27 @@ func (p *playbackEngine) cacheNextTracks() {
 
 func (p *playbackEngine) handleOnTrackChange() {
 	// scrobble the previous song if needed
-	if !p.alreadyScrobbled {
+	p.mu.RLock()
+	alreadyScrobbled := p.alreadyScrobbled
+	p.mu.RUnlock()
+	if !alreadyScrobbled {
 		p.checkScrobble()
 	}
 
 	if p.PlaybackStatus().State == player.Playing {
 		p.playTimeStopwatch.Start()
 	}
+	p.mu.Lock()
 	if p.pendingTrackChangeNum < 0 && (p.wasStopped || p.loopMode != LoopOne) {
 		p.nowPlayingIdx++
-		if p.loopMode == LoopAll && p.nowPlayingIdx == p.getPlayQueueLength() {
+		if p.loopMode == LoopAll && p.nowPlayingIdx == p.getPlayQueueLengthUnsafe() {
 			p.nowPlayingIdx = 0 // wrapped around
 		}
 	} else if p.pendingTrackChangeNum >= 0 {
 		p.nowPlayingIdx = p.pendingTrackChangeNum
 		p.pendingTrackChangeNum = -1
 	}
-	nowPlaying := p.getPlayQueueItemAt(p.nowPlayingIdx)
+	nowPlaying := p.getPlayQueueItemAtUnsafe(p.nowPlayingIdx)
 	_, isRadio := nowPlaying.(*mediaprovider.RadioStation)
 	p.isRadio = isRadio
 
@@ -912,21 +1042,26 @@ func (p *playbackEngine) handleOnTrackChange() {
 	p.alreadyScrobbled = false
 
 	p.curTrackDuration = nowPlaying.Metadata().Duration.Seconds()
+	pauseAfter := p.pauseAfterCurrent
+	p.mu.Unlock()
+
 	p.sendNowPlayingScrobble() // Must come before invokeOnChangeCallbacks b/c track may immediately be scrobbled
 	p.invokeOnSongChangeCallbacks()
 	p.handleTimePosUpdate(false)
 	p.handleNextTrackUpdated()
 
-	if p.pauseAfterCurrent {
+	if pauseAfter {
 		p.Pause()
 		p.SetPauseAfterCurrent(false)
 	}
-
 }
 
 func (p *playbackEngine) handleOnStopped() {
 	p.playTimeStopwatch.Stop()
-	if !p.alreadyScrobbled {
+	p.mu.RLock()
+	alreadyScrobbled := p.alreadyScrobbled
+	p.mu.RUnlock()
+	if !alreadyScrobbled {
 		p.checkScrobble()
 	}
 	p.stopPollTimePos()
@@ -934,36 +1069,44 @@ func (p *playbackEngine) handleOnStopped() {
 	p.invokeOnSongChangeCallbacks()
 	p.invokeNoArgCallbacks(p.onStopped)
 	p.reportPlayback("stopped")
+	p.mu.Lock()
 	p.alreadyScrobbled = false
 	p.wasStopped = true
 	p.nowPlayingIdx = -1
 	p.pauseAfterCurrent = false
+	p.mu.Unlock()
 }
 
 // to be invoked as soon as the next item in the queue that should play changes
 func (p *playbackEngine) handleNextTrackUpdated() {
 	p.cacheNextTracks()
+	p.mu.Lock()
 	p.needToSetNextTrack = true
+	p.mu.Unlock()
 	for _, cb := range p.onBeforeSongChange {
 		var item mediaprovider.MediaItem
 		if idx := p.nextPlayingIndex(); idx >= 0 {
-			item = p.getPlayQueueItemAt(idx)
+			p.mu.RLock()
+			item = p.getPlayQueueItemAtUnsafe(idx)
+			p.mu.RUnlock()
 		}
 		cb(item)
 	}
 }
 
 func (p *playbackEngine) nextPlayingIndex() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	switch p.loopMode {
 	case LoopNone:
-		if p.nowPlayingIdx >= p.getPlayQueueLength()-1 {
+		if p.nowPlayingIdx >= p.getPlayQueueLengthUnsafe()-1 {
 			return -1
 		}
 		return p.nowPlayingIdx + 1
 	case LoopOne:
 		return p.nowPlayingIdx
 	case LoopAll:
-		if p.nowPlayingIdx >= p.getPlayQueueLength()-1 {
+		if p.nowPlayingIdx >= p.getPlayQueueLengthUnsafe()-1 {
 			return 0
 		}
 		return p.nowPlayingIdx + 1
@@ -975,15 +1118,22 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 	var item mediaprovider.MediaItem
 	var url string
 	if idx >= 0 {
-		item = p.getPlayQueueItemAt(idx)
-		url = p.getMediaURLForIdx(idx)
+		p.mu.RLock()
+		item = p.getPlayQueueItemAtUnsafe(idx)
+		url = p.getMediaURLForIdxUnsafe(idx)
+		p.mu.RUnlock()
 	}
-	track, isTrack := item.(*mediaprovider.Track)
-	if p.audiocache != nil && isTrack {
-		p.audiocache.CacheFile(item.Metadata().ID, p.getMediaURLForIdx(idx))
+	var track *mediaprovider.Track
+	var isTrack bool
+	if item != nil {
+		track, isTrack = item.(*mediaprovider.Track)
+		if p.audiocache != nil && isTrack {
+			p.audiocache.CacheFile(item.Metadata().ID, url)
+		}
 	}
 
-	if urlP, ok := p.player.(player.URLPlayer); ok {
+	currentPlayer := p.CurrentPlayer()
+	if urlP, ok := currentPlayer.(player.URLPlayer); ok {
 		var meta mediaprovider.MediaItemMetadata
 		if idx >= 0 {
 			meta = item.Metadata()
@@ -992,7 +1142,7 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 					url = filepath
 				}
 			}
-			if mpvP, ok := p.player.(*mpv.Player); ok && !isTrack {
+			if mpvP, ok := currentPlayer.(*mpv.Player); ok && !isTrack {
 				mpvP.ObserveIcyRadioTitle(func(icytitle string) {
 					var title, artist string
 					if s := strings.Split(icytitle, " - "); len(s) == 2 {
@@ -1015,13 +1165,9 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 			return urlP.SetNextFile(url, meta)
 		}
 		return urlP.PlayFile(url, meta, startTime)
-	} else if trP, ok := p.player.(player.TrackPlayer); ok {
-		var track *mediaprovider.Track
-		if idx >= 0 {
-			track, ok = p.getPlayQueueItemAt(idx).(*mediaprovider.Track)
-			if !ok {
-				return errors.New("cannot play non-Track media item with TrackPlayer")
-			}
+	} else if trP, ok := currentPlayer.(player.TrackPlayer); ok {
+		if idx >= 0 && !isTrack {
+			return errors.New("cannot play non-Track media item with TrackPlayer")
 		}
 		if next {
 			return trP.SetNextTrack(track)
@@ -1031,9 +1177,9 @@ func (p *playbackEngine) setTrack(idx int, next bool, startTime float64) error {
 	panic("Unsupported player type")
 }
 
-func (p *playbackEngine) getMediaURLForIdx(idx int) string {
+func (p *playbackEngine) getMediaURLForIdxUnsafe(idx int) string {
 	var url string
-	item := p.getPlayQueueItemAt(idx)
+	item := p.getPlayQueueItemAtUnsafe(idx)
 	if tr, ok := item.(*mediaprovider.Track); ok {
 		var ts *mediaprovider.TranscodeSettings
 		if p.transcodeCfg.RequestTranscode {
@@ -1048,6 +1194,11 @@ func (p *playbackEngine) getMediaURLForIdx(idx int) string {
 	}
 	return url
 }
+func (p *playbackEngine) getMediaURLForIdx(idx int) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.getMediaURLForIdxUnsafe(idx)
+}
 
 func (p *playbackEngine) setNextTrack(idx int) error {
 	return p.setTrack(idx, true, 0)
@@ -1055,10 +1206,12 @@ func (p *playbackEngine) setNextTrack(idx int) error {
 
 // call BEFORE updating p.nowPlayingIdx
 func (p *playbackEngine) checkScrobble() {
-	if !p.scrobbleCfg.Enabled || p.getPlayQueueLength() == 0 || p.nowPlayingIdx < 0 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.scrobbleCfg.Enabled || p.getPlayQueueLengthUnsafe() == 0 || p.nowPlayingIdx < 0 {
 		return
 	}
-	track, ok := p.getPlayQueueItemAt(p.nowPlayingIdx).(*mediaprovider.Track)
+	track, ok := p.getPlayQueueItemAtUnsafe(p.nowPlayingIdx).(*mediaprovider.Track)
 	if !ok {
 		return // radio stations are not scrobbled
 	}
@@ -1084,21 +1237,24 @@ func (p *playbackEngine) checkScrobble() {
 }
 
 func (p *playbackEngine) sendNowPlayingScrobble() {
-	if !p.scrobbleCfg.Enabled || p.getPlayQueueLength() == 0 || p.nowPlayingIdx < 0 {
+	p.mu.Lock()
+	if !p.scrobbleCfg.Enabled || p.getPlayQueueLengthUnsafe() == 0 || p.nowPlayingIdx < 0 {
+		p.mu.Unlock()
 		return
 	}
-	track, ok := p.getPlayQueueItemAt(p.nowPlayingIdx).(*mediaprovider.Track)
+	track, ok := p.getPlayQueueItemAtUnsafe(p.nowPlayingIdx).(*mediaprovider.Track)
 	if !ok {
+		p.mu.Unlock()
 		return // radio stations are not scrobbled
 	}
-
 	server := p.sm.Server
 	if !server.ClientDecidesScrobble() {
 		// server will count track as scrobbled as soon as it starts playing
 		p.lastScrobbled = track
 		track.PlayCount += 1
 	}
-	go p.sm.Server.TrackBeganPlayback(track.ID)
+	p.mu.Unlock()
+	go server.TrackBeganPlayback(track.ID)
 	p.reportPlayback("starting")
 }
 
